@@ -983,6 +983,14 @@ kj::Own<kj::HttpClient> IoContext::getHttpClientWithSpans(uint channel,
       channel, isInHouse, kj::mv(cfBlobJson), kj::mv(operationName), kj::mv(tags)));
 }
 
+kj::Own<kj::HttpClient> IoContext::getHttpClient(uint channel,
+    bool isInHouse,
+    kj::Maybe<kj::String> cfBlobJson,
+    TraceContext& traceContext) {
+  return asHttpClient(
+      getSubrequestChannel(channel, isInHouse, kj::mv(cfBlobJson), traceContext));
+}
+
 kj::Own<kj::HttpClient> IoContext::getHttpClientNoChecks(uint channel,
     bool isInHouse,
     kj::Maybe<kj::String> cfBlobJson,
