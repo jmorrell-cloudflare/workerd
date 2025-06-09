@@ -1488,8 +1488,13 @@ void Server::InspectorServiceIsolateRegistrar::registerIsolate(
 namespace {
 class RequestObserverWithTracer final: public RequestObserver, public WorkerInterface {
  public:
-  RequestObserverWithTracer(kj::Maybe<kj::Own<WorkerTracer>> tracer, kj::TaskSet& waitUntilTasks)
-      : tracer(kj::mv(tracer)) {}
+  RequestObserverWithTracer(kj::Maybe<kj::Own<WorkerTracer>> tracer,
+      kj::TaskSet& waitUntilTasks,
+      SpanParent parentSpan,
+      SpanParent userSpanParent)
+      : tracer(kj::mv(tracer)),
+        requestSpan(parentSpan.newChild("request_context"_kjc)),
+        userRequestSpan(userSpanParent.newChild("worker"_kjc)) {}
 
   ~RequestObserverWithTracer() noexcept(false) {
     KJ_IF_SOME(t, tracer) {
@@ -1599,11 +1604,21 @@ class RequestObserverWithTracer final: public RequestObserver, public WorkerInte
     }
   }
 
+  virtual SpanParent getSpan() override {
+    return this->requestSpan;
+  }
+  virtual SpanParent getUserSpan() override {
+    return this->userRequestSpan;
+  }
+
  private:
   kj::Maybe<kj::Own<WorkerTracer>> tracer;
   kj::Maybe<WorkerInterface&> inner;
   EventOutcome outcome = EventOutcome::OK;
   kj::uint fetchStatus = 0;
+  SpanBuilder requestSpan;
+  // The root span for the new tracing format.
+  SpanBuilder userRequestSpan;
 };
 
 // IsolateLimitEnforcer that enforces no limits.
@@ -1933,7 +1948,12 @@ class Server::WorkerService final: public Service,
       })));
     }
 
-    observer = kj::refcounted<RequestObserverWithTracer>(mapAddRef(workerTracer), waitUntilTasks);
+    auto fooObserver = kj::refcounted<TailSinkObserver>(mapAddRef(workerTracer));
+    SpanParent spanParent(kj::some(kj::addRef(*fooObserver)));
+    SpanParent userSpanParent(kj::some(kj::addRef(*fooObserver)));
+
+    observer = kj::refcounted<RequestObserverWithTracer>(
+        mapAddRef(workerTracer), waitUntilTasks, kj::mv(spanParent), kj::mv(userSpanParent));
 
     return newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName,
         kj::mv(props), kj::mv(actor), kj::Own<LimitEnforcer>(this, kj::NullDisposer::instance),
