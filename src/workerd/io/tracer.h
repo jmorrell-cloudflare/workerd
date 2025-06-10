@@ -190,4 +190,17 @@ class WorkerTracer: public BaseTracer {
 
   kj::Maybe<kj::Own<tracing::TailStreamWriter>> maybeTailStreamWriter;
 };
+
+class WorkerTracerSpanObserver: public SpanObserver {
+ public:
+  WorkerTracerSpanObserver(kj::Maybe<kj::Own<WorkerTracer>> workerTracer)
+      : workerTracer(kj::mv(workerTracer)) {}
+
+  [[nodiscard]] virtual kj::Own<SpanObserver> newChild() override;
+
+  virtual void report(const Span& span) override;
+
+ private:
+  kj::Maybe<kj::Own<WorkerTracer>> workerTracer;
+};
 }  // namespace workerd

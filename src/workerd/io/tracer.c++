@@ -362,4 +362,35 @@ void WorkerTracer::setFetchResponseInfo(tracing::FetchResponseInfo&& info) {
   }
 }
 
+kj::Own<SpanObserver> WorkerTracerSpanObserver::newChild() {
+  return kj::refcounted<WorkerTracerSpanObserver>(mapAddRef(this->workerTracer));
+}
+
+void WorkerTracerSpanObserver::report(const Span& span) {
+  KJ_IF_SOME(tracer, this->workerTracer) {
+    kj::HashMap<kj::ConstString, tracing::Attribute::Value> tags;
+
+    for (const auto& tag: span.tags) {
+      KJ_SWITCH_ONEOF(tag.value) {
+        KJ_CASE_ONEOF(str, kj::String) {
+          tags.insert(kj::ConstString(kj::str(tag.key)), kj::str(str));
+        }
+        KJ_CASE_ONEOF(val, bool) {
+          tags.insert(kj::ConstString(kj::str(tag.key)), val);
+        }
+        KJ_CASE_ONEOF(num, int64_t) {
+          tags.insert(kj::ConstString(kj::str(tag.key)), num);
+        }
+        KJ_CASE_ONEOF(num, double) {
+          tags.insert(kj::ConstString(kj::str(tag.key)), num);
+        }
+      }
+    }
+
+    CompleteSpan completeSpan(0, 0, kj::ConstString(kj::str(span.operationName)), span.startTime,
+        span.endTime, kj::mv(tags));
+    tracer->addSpan(kj::mv(completeSpan));
+  }
+}
+
 }  // namespace workerd
