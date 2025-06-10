@@ -362,15 +362,4 @@ void WorkerTracer::setFetchResponseInfo(tracing::FetchResponseInfo&& info) {
   }
 }
 
-kj::Own<SpanObserver> TailSinkObserver::newChild() {
-  return kj::refcounted<TailSinkObserver>(mapAddRef(this->workerTracer));
-}
-
-void TailSinkObserver::report(const Span& span) {
-  KJ_IF_SOME(tracer, this->workerTracer) {
-    CompleteSpan completeSpan(kj::ConstString(kj::str(span.operationName)), span.startTime);
-    tracer->addSpan(kj::mv(completeSpan));
-  }
-}
-
 }  // namespace workerd
