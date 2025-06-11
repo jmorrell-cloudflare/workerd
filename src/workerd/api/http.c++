@@ -1936,7 +1936,7 @@ jsg::Promise<jsg::Ref<Response>> fetchImplNoOutputLock(jsg::Lock& js,
         [fetcher = kj::mv(fetcher), jsRequest = kj::mv(jsRequest), urlList = kj::mv(urlList),
             client = kj::mv(client), signal = kj::mv(signal)](
             jsg::Lock& js, kj::HttpClient::WebSocketResponse&& response) mutable
-        -> jsg::Promise<jsg::Ref<Response>> {
+            -> jsg::Promise<jsg::Ref<Response>> {
       KJ_SWITCH_ONEOF(response.webSocketOrBody) {
         KJ_CASE_ONEOF(body, kj::Own<kj::AsyncInputStream>) {
           body = body.attach(kj::mv(client));
@@ -2589,6 +2589,22 @@ kj::Own<WorkerInterface> Fetcher::getClient(
     KJ_CASE_ONEOF(channel, uint) {
       return ioContext.getSubrequestChannel(
           channel, isInHouse, kj::mv(cfStr), kj::mv(operationName));
+    }
+    KJ_CASE_ONEOF(outgoingFactory, IoOwn<OutgoingFactory>) {
+      return outgoingFactory->newSingleUseClient(kj::mv(cfStr));
+    }
+    KJ_CASE_ONEOF(outgoingFactory, kj::Own<CrossContextOutgoingFactory>) {
+      return outgoingFactory->newSingleUseClient(ioContext, kj::mv(cfStr));
+    }
+  }
+  KJ_UNREACHABLE;
+}
+
+kj::Own<WorkerInterface> Fetcher::getClient(
+    IoContext& ioContext, kj::Maybe<kj::String> cfStr, TraceContext& traceContext) {
+  KJ_SWITCH_ONEOF(channelOrClientFactory) {
+    KJ_CASE_ONEOF(channel, uint) {
+      return ioContext.getSubrequestChannel(channel, isInHouse, kj::mv(cfStr), traceContext);
     }
     KJ_CASE_ONEOF(outgoingFactory, IoOwn<OutgoingFactory>) {
       return outgoingFactory->newSingleUseClient(kj::mv(cfStr));

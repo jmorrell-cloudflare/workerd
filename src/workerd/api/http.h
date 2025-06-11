@@ -501,6 +501,13 @@ public:
       kj::Maybe<kj::String> cfStr,
       kj::ConstString operationName);
 
+  // Returns an `WorkerInterface` that is only valid for the lifetime of the current
+  // `IoContext`.
+  kj::Own<WorkerInterface> getClient(
+    IoContext& ioContext,
+    kj::Maybe<kj::String> cfStr,
+    TraceContext& traceContext);
+
   // Wraps kj::Url::parse to take into account whether the Fetcher requires a host to be
   // specified on URLs, Fetcher-specific URL decoding options, and error handling.
   kj::Url parseUrl(jsg::Lock& js, kj::StringPtr url);

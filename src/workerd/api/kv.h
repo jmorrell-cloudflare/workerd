@@ -247,6 +247,12 @@ class KvNamespace: public jsg::Object {
   }
 
  protected:
+  kj::Own<kj::HttpClient> getHttpClient(IoContext& context,
+      kj::HttpHeaders& headers,
+      kj::OneOf<LimitEnforcer::KvOpType, kj::LiteralStringConst> opTypeOrUnknown,
+      kj::StringPtr urlStr,
+      TraceContext& traceContext);
+
   // Do the boilerplate work of constructing an HTTP client to KV. Setting a KvOptType causes
   // the limiter for that op type to be checked. If a string is used, that's used as the operation
   // name for the HttpClient without any limiter enforcement.

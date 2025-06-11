@@ -14,7 +14,7 @@ const helloWorld :Workerd.Worker = (
     (name = "worker", esModule = embed "worker.js")
   ],
   compatibilityDate = "2024-10-14",
-  compatibilityFlags = ["experimental", "streaming_tail_worker"],
+  compatibilityFlags = ["experimental", "streaming_tail_worker", "tail_worker_user_spans"],
   streamingTails = ["log"],
   bindings = [
     (name = "KV", kvNamespace = "kvService"),

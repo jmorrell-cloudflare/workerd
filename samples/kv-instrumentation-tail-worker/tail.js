@@ -6,7 +6,7 @@ export default {
   tailStream(...args) {
     console.log(...args);
     return (...args) => {
-      console.log(...args);
+      console.log(JSON.stringify(...args, ' ', 2));
     };
   },
 };
