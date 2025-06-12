@@ -40,15 +40,29 @@ static void validateKeyName(kj::StringPtr method, kj::StringPtr name) {
       ".");
 }
 
-static void parseListMetadata(
-    jsg::Lock& js, jsg::JsValue listResponse, kj::Maybe<jsg::JsValue> cacheStatus) {
+static void parseListMetadata(TraceContext& traceContext,
+    jsg::Lock& js,
+    jsg::JsValue listResponse,
+    kj::Maybe<jsg::JsValue> cacheStatus) {
   static constexpr auto METADATA = "metadata"_kjc;
   static constexpr auto KEYS = "keys"_kjc;
+
+  // TODO: This doesn't result in in attribute... why?
+  traceContext.userSpan.setTag("test"_kjc, kj::str("test"));
 
   js.withinHandleScope([&] {
     auto obj = KJ_ASSERT_NONNULL(listResponse.tryCast<jsg::JsObject>());
     KJ_IF_SOME(keysArr, obj.get(js, KEYS).tryCast<jsg::JsArray>()) {
       auto length = keysArr.size();
+      // TODO: Assuming this works, also check on cursor and list_complete
+      // TODO: pull out:
+      // cloudflare.kv.response.returned_rows
+      // cloudflare.kv.response.list_complete
+      // cloudflare.kv.response.cursor
+      // cloudflare.kv.response.cache_status
+      // This executes but does not emit the attribute for some reason
+      // KJ_LOG(WARNING, "rows", length);
+      // traceContext.userSpan.setTag("cloudflare.kv.response.returned_rows"_kjc, kj::str(length));
       for (int i = 0; i < length; i++) {
         js.withinHandleScope([&] {
           KJ_IF_SOME(key, keysArr.get(js, i).tryCast<jsg::JsObject>()) {
@@ -84,6 +98,7 @@ kj::Own<kj::HttpClient> KvNamespace::getHttpClient(IoContext& context,
 
   headers.add(FLPROD_405_HEADER, urlStr);
   for (const auto& header: additionalHeaders) {
+    KJ_LOG(WARNING, header.name, header.value);
     headers.add(header.name.asPtr(), header.value.asPtr());
   }
 
@@ -448,18 +463,19 @@ jsg::Promise<jsg::JsRef<jsg::JsValue>> KvNamespace::list(
     jsg::Lock& js, jsg::Optional<ListOptions> options) {
   return js.evalNow([&] {
     auto& context = IoContext::current();
-    auto traceSpan = context.makeTraceSpan("kv_list_internal"_kjc);
-    auto userSpan = context.makeUserTraceSpan("kv_list_user"_kjc);
+    auto traceSpan = context.makeTraceSpan(kj::ConstString(kj::str(bindingName, ".list")));
+    auto userSpan = context.makeUserTraceSpan(kj::ConstString(kj::str(bindingName, ".list")));
     TraceContext traceContext(kj::mv(traceSpan), kj::mv(userSpan));
 
     // TODO:
     // - factor repetitive bits out into shared function
-    // - how to get namespace info?
     traceContext.userSpan.setTag("db.system"_kjc, kj::str("cloudflare.kv"_kjc));
-    traceContext.userSpan.setTag("db.namespace"_kjc, kj::str("TODO"_kjc));
+    traceContext.userSpan.setTag("db.namespace"_kjc, kj::str(bindingName));
     traceContext.userSpan.setTag("db.operation.name"_kjc, kj::str("list"_kjc));
     traceContext.userSpan.setTag("cloudflare.binding_type"_kjc, kj::str("KV"_kjc));
-    traceContext.userSpan.setTag("cloudflare.kv.namespace.id"_kjc, kj::str("TODO"_kjc));
+    // I think this would require modifying workerd.capnp to allow the id to be passed
+    // down from wrangler through to the capnp definition
+    // traceContext.userSpan.setTag("cloudflare.kv.namespace.id"_kjc, kj::str("TODO"_kjc));
 
     kj::Url url;
     url.scheme = kj::str("https");
@@ -467,19 +483,20 @@ jsg::Promise<jsg::JsRef<jsg::JsValue>> KvNamespace::list(
     KJ_IF_SOME(o, options) {
       KJ_IF_SOME(limit, o.limit) {
         if (limit > 0) {
-          userSpan.setTag("cloudflare.kv.query.limit"_kjc, (int64_t)limit);
+          traceContext.userSpan.setTag("cloudflare.kv.query.limit"_kjc, kj::str(limit));
           url.query.add(kj::Url::QueryParam{kj::str("key_count_limit"), kj::str(limit)});
         }
       }
       KJ_IF_SOME(maybePrefix, o.prefix) {
         KJ_IF_SOME(prefix, maybePrefix) {
-          userSpan.setTag("cloudflare.kv.query.prefix"_kjc, kj::str(prefix));
+          traceContext.userSpan.setTag("cloudflare.kv.query.prefix"_kjc, kj::str(prefix));
           url.query.add(kj::Url::QueryParam{kj::str("prefix"), kj::str(prefix)});
         }
       }
       KJ_IF_SOME(maybeCursor, o.cursor) {
         KJ_IF_SOME(cursor, maybeCursor) {
-          userSpan.setTag("cloudflare.kv.query.cursor"_kjc, kj::str(cursor));
+          KJ_LOG(WARNING, "here", cursor);
+          traceContext.userSpan.setTag("cloudflare.kv.query.cursor"_kjc, kj::str(cursor));
           url.query.add(kj::Url::QueryParam{kj::str("cursor"), kj::str(cursor)});
         }
       }
@@ -493,7 +510,7 @@ jsg::Promise<jsg::JsRef<jsg::JsValue>> KvNamespace::list(
 
     auto request = client->request(kj::HttpMethod::GET, urlStr, headers);
     return context.awaitIo(js, kj::mv(request.response),
-        [&context, client = kj::mv(client)](jsg::Lock& js,
+        [&context, &traceContext, client = kj::mv(client)](jsg::Lock& js,
             kj::HttpClient::Response&& response) mutable -> jsg::Promise<jsg::JsRef<jsg::JsValue>> {
       checkForErrorStatus("GET", response);
 
@@ -512,9 +529,10 @@ jsg::Promise<jsg::JsRef<jsg::JsValue>> KvNamespace::list(
       return context.awaitIo(js,
           stream->readAllText(context.getLimitEnforcer().getBufferingLimit())
               .attach(kj::mv(stream)),
-          [cacheStatus = kj::mv(cacheStatus)](jsg::Lock& js, kj::String text) mutable {
+          [cacheStatus = kj::mv(cacheStatus), &traceContext](
+              jsg::Lock& js, kj::String text) mutable {
         auto result = jsg::JsValue::fromJson(js, text);
-        parseListMetadata(js, result,
+        parseListMetadata(traceContext, js, result,
             cacheStatus.map(
                 [&](jsg::JsRef<jsg::JsValue>& cs) -> jsg::JsValue { return cs.getHandle(js); }));
         return jsg::JsRef(js, result);

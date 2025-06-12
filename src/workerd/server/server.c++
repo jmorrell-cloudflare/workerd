@@ -498,7 +498,7 @@ class PromisedNetworkAddress final: public kj::NetworkAddress {
  public:
   PromisedNetworkAddress(kj::Promise<kj::Own<kj::NetworkAddress>> promise)
       : promise(promise.then([this](kj::Own<kj::NetworkAddress> result) { addr = kj::mv(result); })
-                    .fork()) {}
+                .fork()) {}
 
   kj::Promise<kj::Own<kj::AsyncIoStream>> connect() override {
     KJ_IF_SOME(a, addr) {
@@ -2890,10 +2890,12 @@ static kj::Maybe<WorkerdApi::Global> createBinding(kj::StringPtr workerName,
 
     case config::Worker::Binding::KV_NAMESPACE: {
       uint channel = (uint)subrequestChannels.size() + IoContext::SPECIAL_SUBREQUEST_CHANNEL_COUNT;
+      KJ_LOG(WARNING, "binding name"_kjc, bindingName);
       subrequestChannels.add(
           FutureSubrequestChannel{binding.getKvNamespace(), kj::mv(errorContext)});
 
-      return makeGlobal(Global::KvNamespace{.subrequestChannel = channel});
+      return makeGlobal(Global::KvNamespace{
+        .subrequestChannel = channel, .bindingName = kj::str(binding.getName())});
     }
 
     case config::Worker::Binding::R2_BUCKET: {
@@ -3132,7 +3134,7 @@ kj::Own<Server::Service> Server::makeWorker(kj::StringPtr name,
             jsg::Lock& js, kj::StringPtr specifier, kj::Maybe<kj::String> referrer,
             jsg::CompilationObserver& observer, jsg::ModuleRegistry::ResolveMethod method,
             kj::Maybe<kj::StringPtr> rawSpecifier) mutable
-        -> kj::Maybe<kj::OneOf<kj::String, jsg::ModuleRegistry::ModuleInfo>> {
+            -> kj::Maybe<kj::OneOf<kj::String, jsg::ModuleRegistry::ModuleInfo>> {
       kj::HashMap<kj::StringPtr, kj::StringPtr> attributes;
       KJ_IF_SOME(moduleOrRedirect,
           workerd::fallback::tryResolve(workerd::fallback::Version::V1,

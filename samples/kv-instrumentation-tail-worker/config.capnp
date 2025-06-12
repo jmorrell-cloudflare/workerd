@@ -17,7 +17,7 @@ const helloWorld :Workerd.Worker = (
   compatibilityFlags = ["experimental", "streaming_tail_worker", "tail_worker_user_spans"],
   streamingTails = ["log"],
   bindings = [
-    (name = "KV", kvNamespace = "kvService"),
+    (name = "USERS_NOTIFICATION_CONFIG", kvNamespace = "kvService"),
   ]
 );
 

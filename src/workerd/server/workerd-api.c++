@@ -701,7 +701,8 @@ Worker::Script::Module WorkerdApi::readModuleConf(config::Worker::Module::Reader
       case config::Worker::Module::COMMON_JS_MODULE: {
         Worker::Script::CommonJsModule result{.body = conf.getCommonJsModule()};
         if (conf.hasNamedExports()) {
-          result.namedExports = KJ_MAP(name, conf.getNamedExports()) -> kj::StringPtr { return name; };
+          result.namedExports =
+              KJ_MAP(name, conf.getNamedExports()) -> kj::StringPtr { return name; };
         }
         return result;
       }
@@ -850,7 +851,7 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
 
     KJ_CASE_ONEOF(ns, Global::KvNamespace) {
       value = lock.wrap(context,
-          lock.alloc<api::KvNamespace>(
+          lock.alloc<api::KvNamespace>(kj::str(ns.bindingName),
               kj::Array<api::KvNamespace::AdditionalHeader>{}, ns.subrequestChannel));
     }
 
@@ -1284,7 +1285,7 @@ kj::Own<jsg::modules::ModuleRegistry> WorkerdApi::initializeBundleModuleRegistry
       pyodideBundleBuilder.addSynthetic(diskCacheSpecifier,
           jsg::modules::Module::newJsgObjectModuleHandler<DiskCache, JsgWorkerdIsolate_TypeWrapper>(
               [&packageDiskCacheRoot = pythonConfig.packageDiskCacheRoot](jsg::Lock& js) mutable
-              -> jsg::Ref<DiskCache> { return js.alloc<DiskCache>(packageDiskCacheRoot); }));
+                  -> jsg::Ref<DiskCache> { return js.alloc<DiskCache>(packageDiskCacheRoot); }));
       // Inject a (disabled) SimplePythonLimiter
       pyodideBundleBuilder.addSynthetic(limiterSpecifier,
           jsg::modules::Module::newJsgObjectModuleHandler<SimplePythonLimiter,
@@ -1405,7 +1406,7 @@ kj::Own<jsg::modules::ModuleRegistry> WorkerdApi::initializeBundleModuleRegistry
                           jsg::modules::Module::Type::FALLBACK,
                           jsg::modules::Module::newCjsStyleModuleHandler<api::CommonJsModuleContext,
                               JsgWorkerdIsolate_TypeWrapper>(ptr, mod.name),
-              KJ_MAP(name, named) {
+                          KJ_MAP(name, named) {
                     return kj::str(name);
                   }).attach(kj::mv(ownedData)));
                 }

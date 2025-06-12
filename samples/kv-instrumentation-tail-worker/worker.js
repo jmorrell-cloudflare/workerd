@@ -4,16 +4,25 @@
 
 export default {
   async fetch(req, env) {
-    const { KV } = env;
+    const { USERS_NOTIFICATION_CONFIG } = env;
 
-    console.log(KV);
-    await KV.put("test1", "1");
-    await KV.put("test2", "2");
-    await KV.put("test3", "3");
-    await KV.put("test4", "4");
+    console.log(USERS_NOTIFICATION_CONFIG);
+    await USERS_NOTIFICATION_CONFIG.put("test1", "1");
+    await USERS_NOTIFICATION_CONFIG.put("test2", "2");
+    await USERS_NOTIFICATION_CONFIG.put("test3", "3");
+    await USERS_NOTIFICATION_CONFIG.put("test4", "4");
 
-    let res = await KV.list();
+    let res = await USERS_NOTIFICATION_CONFIG.list();
     let keys = res.keys.map(key => key.name);
+
+    // these arguments should get added to the span
+    res = await USERS_NOTIFICATION_CONFIG.list({
+      prefix: "te",
+      limit: 2,
+      cursor: "test1",
+    });
+    console.log(res);
+    keys = res.keys.map(key => key.name);
 
     return new Response(`Received: ${keys}`);
   }
