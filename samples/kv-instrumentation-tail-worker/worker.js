@@ -12,17 +12,24 @@ export default {
     await USERS_NOTIFICATION_CONFIG.put("test3", "33333");
     await USERS_NOTIFICATION_CONFIG.put("test4", "44444");
 
-    let res = await USERS_NOTIFICATION_CONFIG.list();
-    let keys = res.keys.map(key => key.name);
 
     // these arguments should get added to the span
-    res = await USERS_NOTIFICATION_CONFIG.list({
+    let res = await USERS_NOTIFICATION_CONFIG.list({
       prefix: "te",
       limit: 2,
       cursor: "test1",
     });
-    console.log(res);
-    keys = res.keys.map(key => key.name);
+    let keys = res.keys.map(key => key.name);
+
+    let value = await USERS_NOTIFICATION_CONFIG.get("test1");
+    // value = await USERS_NOTIFICATION_CONFIG.get("test5");
+    // try {
+    //   value = await USERS_NOTIFICATION_CONFIG.get("");
+    // } catch (e) {
+    //   console.log(e);
+    // }
+    // value = await USERS_NOTIFICATION_CONFIG.get(['test1', 'test2'], 'json');
+    console.log(value);
 
     return new Response(`Received: ${keys}`);
   }

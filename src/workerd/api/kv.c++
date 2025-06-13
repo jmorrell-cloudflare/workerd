@@ -98,6 +98,7 @@ kj::Own<kj::HttpClient> KvNamespace::getHttpClient(IoContext& context,
     kj::StringPtr urlStr,
     TraceContext& traceContext) {
 
+  // TODO: Factor this out into its own function
   KJ_SWITCH_ONEOF(opTypeOrUnknown) {
     KJ_CASE_ONEOF(name, kj::LiteralStringConst) {}
     KJ_CASE_ONEOF(opType, LimitEnforcer::KvOpType) {
@@ -208,23 +209,26 @@ kj::Own<kj::HttpClient> KvNamespace::getHttpClient(IoContext& context,
   return client;
 }
 
-jsg::Promise<KvNamespace::GetResult> KvNamespace::getSingle(
-    jsg::Lock& js, kj::String name, jsg::Optional<kj::OneOf<kj::String, GetOptions>> options) {
+jsg::Promise<KvNamespace::GetResult> KvNamespace::getSingle(IoContext& context,
+    jsg::Lock& js,
+    kj::String name,
+    jsg::Optional<kj::OneOf<kj::String, GetOptions>> options,
+    TraceContext& traceContext) {
   return js.evalNow([&] {
-    auto resp =
-        getWithMetadataImpl(js, kj::mv(name), kj::mv(options), LimitEnforcer::KvOpType::GET);
+    auto resp = getWithMetadataImpl(
+        context, js, kj::mv(name), kj::mv(options), LimitEnforcer::KvOpType::GET, traceContext);
     return resp.then(js,
         [](jsg::Lock&, KvNamespace::GetWithMetadataResult result) { return kj::mv(result.value); });
   });
 }
 
-jsg::Promise<jsg::JsRef<jsg::JsMap>> KvNamespace::getBulk(jsg::Lock& js,
+jsg::Promise<jsg::JsRef<jsg::JsMap>> KvNamespace::getBulk(IoContext& context,
+    jsg::Lock& js,
     kj::Array<kj::String> name,
     jsg::Optional<kj::OneOf<kj::String, GetOptions>> options,
-    bool withMetadata) {
+    bool withMetadata,
+    TraceContext& traceContext) {
   return js.evalNow([&] {
-    auto& context = IoContext::current();
-
     kj::Url url;
     url.scheme = kj::str("https");
     url.host = kj::str("fake-host");
@@ -239,7 +243,7 @@ jsg::Promise<jsg::JsRef<jsg::JsMap>> KvNamespace::getBulk(jsg::Lock& js,
     auto urlStr = url.toString(kj::Url::Context::HTTP_PROXY_REQUEST);
 
     auto client =
-        getHttpClient(context, headers, LimitEnforcer::KvOpType::GET_BULK, urlStr, kj::mv(options));
+        getHttpClient(context, headers, LimitEnforcer::KvOpType::GET_BULK, urlStr, traceContext);
 
     auto promise = context.waitForOutputLocks().then(
         [client = kj::mv(client), urlStr = kj::mv(urlStr), headers = kj::mv(headers),
@@ -323,44 +327,74 @@ kj::OneOf<jsg::Promise<KvNamespace::GetResult>, jsg::Promise<jsg::JsRef<jsg::JsM
     get(jsg::Lock& js,
         kj::OneOf<kj::String, kj::Array<kj::String>> name,
         jsg::Optional<kj::OneOf<kj::String, GetOptions>> options) {
+  auto& context = IoContext::current();
+  auto traceSpan = context.makeTraceSpan(kj::ConstString(kj::str(bindingName, ".get")));
+  auto userSpan = context.makeUserTraceSpan(kj::ConstString(kj::str(bindingName, ".get")));
+  TraceContext traceContext(kj::mv(traceSpan), kj::mv(userSpan));
+
+  traceContext.userSpan.setTag("db.system"_kjc, kj::str("cloudflare.kv"_kjc));
+  traceContext.userSpan.setTag("db.namespace"_kjc, kj::str(bindingName));
+  traceContext.userSpan.setTag("db.operation.name"_kjc, kj::str("get"_kjc));
+  traceContext.userSpan.setTag("cloudflare.binding_type"_kjc, kj::str("KV"_kjc));
+
   KJ_SWITCH_ONEOF(name) {
     KJ_CASE_ONEOF(arr, kj::Array<kj::String>) {
-      return getBulk(js, kj::mv(arr), kj::mv(options), false);
+      // TODO: Array<string> not a supported tag type yet so I serialized it to a string
+      traceContext.userSpan.setTag("cloudflare.kv.query.keys"_kjc, kj::strArray(arr, ", "));
+      return getBulk(context, js, kj::mv(arr), kj::mv(options), false, traceContext);
     }
     KJ_CASE_ONEOF(str, kj::String) {
-      return getSingle(js, kj::mv(str), kj::mv(options));
+      traceContext.userSpan.setTag("cloudflare.kv.query.key"_kjc, kj::str(str));
+      return getSingle(context, js, kj::mv(str), kj::mv(options), traceContext);
     }
   }
   KJ_UNREACHABLE;
 };
 
 jsg::Promise<KvNamespace::GetWithMetadataResult> KvNamespace::getWithMetadataSingle(
-    jsg::Lock& js, kj::String name, jsg::Optional<kj::OneOf<kj::String, GetOptions>> options) {
-  return getWithMetadataImpl(js, kj::mv(name), kj::mv(options), LimitEnforcer::KvOpType::GET_WITH);
+    IoContext& context,
+    jsg::Lock& js,
+    kj::String name,
+    jsg::Optional<kj::OneOf<kj::String, GetOptions>> options,
+    TraceContext& traceContext) {
+  return getWithMetadataImpl(
+      context, js, kj::mv(name), kj::mv(options), LimitEnforcer::KvOpType::GET_WITH, traceContext);
 }
 
 kj::OneOf<jsg::Promise<KvNamespace::GetWithMetadataResult>, jsg::Promise<jsg::JsRef<jsg::JsMap>>>
 KvNamespace::getWithMetadata(jsg::Lock& js,
     kj::OneOf<kj::Array<kj::String>, kj::String> name,
     jsg::Optional<kj::OneOf<kj::String, GetOptions>> options) {
+  auto& context = IoContext::current();
+  auto traceSpan = context.makeTraceSpan(kj::ConstString(kj::str(bindingName, ".getWithMetadata")));
+  auto userSpan =
+      context.makeUserTraceSpan(kj::ConstString(kj::str(bindingName, ".getWithMetadata")));
+  TraceContext traceContext(kj::mv(traceSpan), kj::mv(userSpan));
+
+  traceContext.userSpan.setTag("db.system"_kjc, kj::str("cloudflare.kv"_kjc));
+  traceContext.userSpan.setTag("db.namespace"_kjc, kj::str(bindingName));
+  traceContext.userSpan.setTag("db.operation.name"_kjc, kj::str("getWithMetadata"_kjc));
+  traceContext.userSpan.setTag("cloudflare.binding_type"_kjc, kj::str("KV"_kjc));
+
   KJ_SWITCH_ONEOF(name) {
     KJ_CASE_ONEOF(arr, kj::Array<kj::String>) {
-      return getBulk(js, kj::mv(arr), kj::mv(options), true);
+      return getBulk(context, js, kj::mv(arr), kj::mv(options), true, traceContext);
     }
     KJ_CASE_ONEOF(str, kj::String) {
-      return getWithMetadataSingle(js, kj::mv(str), kj::mv(options));
+      return getWithMetadataSingle(context, js, kj::mv(str), kj::mv(options), traceContext);
     }
   }
   KJ_UNREACHABLE;
 }
 
-jsg::Promise<KvNamespace::GetWithMetadataResult> KvNamespace::getWithMetadataImpl(jsg::Lock& js,
+jsg::Promise<KvNamespace::GetWithMetadataResult> KvNamespace::getWithMetadataImpl(
+    IoContext& context,
+    jsg::Lock& js,
     kj::String name,
     jsg::Optional<kj::OneOf<kj::String, GetOptions>> options,
-    LimitEnforcer::KvOpType op) {
+    LimitEnforcer::KvOpType op,
+    TraceContext& traceContext) {
   validateKeyName("GET", name);
-
-  auto& context = IoContext::current();
 
   kj::Url url;
   url.scheme = kj::str("https");
@@ -372,13 +406,16 @@ jsg::Promise<KvNamespace::GetWithMetadataResult> KvNamespace::getWithMetadataImp
   KJ_IF_SOME(oneOfOptions, options) {
     KJ_SWITCH_ONEOF(oneOfOptions) {
       KJ_CASE_ONEOF(t, kj::String) {
+        traceContext.userSpan.setTag("cloudflare.kv.query.type"_kjc, kj::str(t));
         type = kj::str(t);
       }
       KJ_CASE_ONEOF(options, GetOptions) {
         KJ_IF_SOME(t, options.type) {
+          traceContext.userSpan.setTag("cloudflare.kv.query.type"_kjc, kj::str(t));
           type = kj::str(t);
         }
         KJ_IF_SOME(cacheTtl, options.cacheTtl) {
+          traceContext.userSpan.setTag("cloudflare.kv.query.cache_ttl"_kjc, (long)cacheTtl);
           url.query.add(kj::Url::QueryParam{kj::str("cache_ttl"), kj::str(cacheTtl)});
         }
       }
@@ -388,19 +425,24 @@ jsg::Promise<KvNamespace::GetWithMetadataResult> KvNamespace::getWithMetadataImp
   auto urlStr = url.toString(kj::Url::Context::HTTP_PROXY_REQUEST);
 
   auto headers = kj::HttpHeaders(context.getHeaderTable());
-  auto client = getHttpClient(context, headers, op, urlStr, kj::mv(options));
+  auto client = getHttpClient(context, headers, op, urlStr, traceContext);
 
   auto request = client->request(kj::HttpMethod::GET, urlStr, headers);
   return context.awaitIo(js, kj::mv(request.response),
-      [type = kj::mv(type), &context, client = kj::mv(client)](
+      [type = kj::mv(type), &context, client = kj::mv(client), traceContext = kj::mv(traceContext)](
           jsg::Lock& js, kj::HttpClient::Response&& response) mutable
           -> jsg::Promise<KvNamespace::GetWithMetadataResult> {
     auto cacheStatus =
         response.headers->get(context.getHeaderIds().cfCacheStatus).map([&](kj::StringPtr cs) {
+      traceContext.userSpan.setTag("cloudflare.kv.response.cache_status"_kjc, kj::str(cs));
       return jsg::JsRef<jsg::JsValue>(js, js.strIntern(cs));
     });
 
     if (response.statusCode == 404 || response.statusCode == 410) {
+      traceContext.userSpan.setTag(
+          "cloudflare.kv.response.returned_rows"_kjc, static_cast<double>(0));
+      traceContext.userSpan.setTag("cloudflare.kv.response.size"_kjc, static_cast<double>(0));
+      traceContext.userSpan.setTag("cloudflare.kv.response.metadata"_kjc, false);
       return js.resolvedPromise(KvNamespace::GetWithMetadataResult{
         .value = kj::none,
         .metadata = kj::none,
@@ -408,6 +450,7 @@ jsg::Promise<KvNamespace::GetWithMetadataResult> KvNamespace::getWithMetadataImp
       });
     }
 
+    // TODO
     checkForErrorStatus("GET", response);
 
     auto metaheader = response.headers->get(context.getHeaderIds().cfKvMetadata);
@@ -415,9 +458,13 @@ jsg::Promise<KvNamespace::GetWithMetadataResult> KvNamespace::getWithMetadataImp
     KJ_IF_SOME(m, metaheader) {
       maybeMeta = kj::str(m);
     }
+    traceContext.userSpan.setTag("cloudflare.kv.response.metadata"_kjc, maybeMeta != kj::none);
+    traceContext.userSpan.setTag(
+        "cloudflare.kv.response.returned_rows"_kjc, static_cast<double>(1));
 
     auto typeName =
         type.map([](const kj::String& s) -> kj::StringPtr { return s; }).orDefault("text");
+    traceContext.userSpan.setTag("cloudflare.kv.response.type"_kjc, kj::str(typeName));
 
     auto& context = IoContext::current();
     auto stream = newSystemStream(response.body.attach(kj::mv(client)),
@@ -425,6 +472,11 @@ jsg::Promise<KvNamespace::GetWithMetadataResult> KvNamespace::getWithMetadataImp
             context, *response.headers, Response::BodyEncoding::AUTO, FeatureFlags::get(js)));
 
     jsg::Promise<KvNamespace::GetResult> result = nullptr;
+
+    auto receivedBodySize = stream->tryGetLength(StreamEncoding::IDENTITY);
+    KJ_IF_SOME(bs, receivedBodySize) {
+      traceContext.userSpan.setTag("cloudflare.kv.response.size"_kjc, kj::str(bs));
+    }
 
     if (typeName == "stream") {
       result = js.resolvedPromise(
@@ -455,6 +507,7 @@ jsg::Promise<KvNamespace::GetWithMetadataResult> KvNamespace::getWithMetadataImp
           "Unknown response type. Possible types are \"text\", \"arrayBuffer\", "
           "\"json\", and \"stream\".");
     }
+
     return result.then(js,
         [maybeMeta = kj::mv(maybeMeta), cacheStatus = kj::mv(cacheStatus)](jsg::Lock& js,
             KvNamespace::GetResult result) mutable -> KvNamespace::GetWithMetadataResult {

@@ -54,13 +54,18 @@ class KvNamespace: public jsg::Object {
   using GetResult = kj::Maybe<
       kj::OneOf<jsg::Ref<ReadableStream>, kj::Array<byte>, kj::String, jsg::JsRef<jsg::JsValue>>>;
 
-  jsg::Promise<KvNamespace::GetResult> getSingle(
-      jsg::Lock& js, kj::String name, jsg::Optional<kj::OneOf<kj::String, GetOptions>> options);
+  jsg::Promise<KvNamespace::GetResult> getSingle(IoContext& context,
+      jsg::Lock& js,
+      kj::String name,
+      jsg::Optional<kj::OneOf<kj::String, GetOptions>> options,
+      TraceContext& traceContext);
 
-  jsg::Promise<jsg::JsRef<jsg::JsMap>> getBulk(jsg::Lock& js,
+  jsg::Promise<jsg::JsRef<jsg::JsMap>> getBulk(IoContext& context,
+      jsg::Lock& js,
       kj::Array<kj::String> name,
       jsg::Optional<kj::OneOf<kj::String, GetOptions>> options,
-      bool withMetadata);
+      bool withMetadata,
+      TraceContext& traceContext);
 
   kj::String formBulkBodyString(jsg::Lock& js,
       kj::Array<kj::String>& names,
@@ -85,13 +90,18 @@ class KvNamespace: public jsg::Object {
     });
   };
 
-  jsg::Promise<GetWithMetadataResult> getWithMetadataImpl(jsg::Lock& js,
+  jsg::Promise<GetWithMetadataResult> getWithMetadataImpl(IoContext& context,
+      jsg::Lock& js,
       kj::String name,
       jsg::Optional<kj::OneOf<kj::String, GetOptions>> options,
-      LimitEnforcer::KvOpType op);
+      LimitEnforcer::KvOpType op,
+      TraceContext& traceContext);
 
-  jsg::Promise<KvNamespace::GetWithMetadataResult> getWithMetadataSingle(
-      jsg::Lock& js, kj::String name, jsg::Optional<kj::OneOf<kj::String, GetOptions>> options);
+  jsg::Promise<KvNamespace::GetWithMetadataResult> getWithMetadataSingle(IoContext& context,
+      jsg::Lock& js,
+      kj::String name,
+      jsg::Optional<kj::OneOf<kj::String, GetOptions>> options,
+      TraceContext& traceContext);
 
   kj::OneOf<jsg::Promise<KvNamespace::GetWithMetadataResult>, jsg::Promise<jsg::JsRef<jsg::JsMap>>>
   getWithMetadata(jsg::Lock& js,
