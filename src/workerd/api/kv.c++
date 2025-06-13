@@ -73,6 +73,7 @@ static void parseListMetadata(TraceContext& traceContext,
       }
     }
 
+    // TODO: unused variable warning
     KJ_IF_SOME(cursor, obj.get(js, CURSOR).tryCast<jsg::JsString>()) {
       traceContext.userSpan.setTag("cloudflare.kv.response.cursor"_kjc, true);
     }
@@ -552,9 +553,19 @@ jsg::Promise<void> KvNamespace::put(jsg::Lock& js,
     jsg::Optional<PutOptions> options,
     const jsg::TypeHandler<KvNamespace::PutSupportedTypes>& putTypeHandler) {
   return js.evalNow([&] {
-    validateKeyName("PUT", name);
-
     auto& context = IoContext::current();
+    auto traceSpan = context.makeTraceSpan(kj::ConstString(kj::str(bindingName, ".put")));
+    auto userSpan = context.makeUserTraceSpan(kj::ConstString(kj::str(bindingName, ".put")));
+    TraceContext traceContext(kj::mv(traceSpan), kj::mv(userSpan));
+
+    traceContext.userSpan.setTag("db.system"_kjc, kj::str("cloudflare.kv"_kjc));
+    traceContext.userSpan.setTag("db.namespace"_kjc, kj::str(bindingName));
+    traceContext.userSpan.setTag("db.operation.name"_kjc, kj::str("list"_kjc));
+    traceContext.userSpan.setTag("cloudflare.binding_type"_kjc, kj::str("KV"_kjc));
+    traceContext.userSpan.setTag("cloudflare.kv.query.key"_kjc, kj::str(name));
+
+    // TODO: catch, annotate, and rethrow errors thrown here or pass the traceContext through
+    validateKeyName("PUT", name);
 
     kj::Url url;
     url.scheme = kj::str("https");
@@ -566,20 +577,26 @@ jsg::Promise<void> KvNamespace::put(jsg::Lock& js,
 
     // If any optional parameters were specified by the client, append them to
     // the URL's query parameters.
+    bool metadataIncluded = false;
     KJ_IF_SOME(o, options) {
       KJ_IF_SOME(expiration, o.expiration) {
+        traceContext.userSpan.setTag("cloudflare.kv.query.expiration"_kjc, (double)expiration);
         url.query.add(kj::Url::QueryParam{kj::str("expiration"), kj::str(expiration)});
       }
       KJ_IF_SOME(expirationTtl, o.expirationTtl) {
+        traceContext.userSpan.setTag(
+            "cloudflare.kv.query.expiration_ttl"_kjc, (double)expirationTtl);
         url.query.add(kj::Url::QueryParam{kj::str("expiration_ttl"), kj::str(expirationTtl)});
       }
       KJ_IF_SOME(maybeMetadata, o.metadata) {
         KJ_IF_SOME(metadata, maybeMetadata) {
           kj::String json = metadata.getHandle(js).toJson(js);
           headers.set(context.getHeaderIds().cfKvMetadata, kj::mv(json));
+          metadataIncluded = true;
         }
       }
     }
+    traceContext.userSpan.setTag("cloudflare.kv.query.metadata"_kjc, metadataIncluded);
 
     PutSupportedTypes supportedBody;
 
@@ -613,10 +630,15 @@ jsg::Promise<void> KvNamespace::put(jsg::Lock& js,
       }
     }
 
+    KJ_IF_SOME(size, expectedBodySize) {
+      // TODO: fix type conversion
+      traceContext.userSpan.setTag("cloudflare.kv.query.payload.size"_kjc, kj::str(size));
+    }
+
     auto urlStr = url.toString(kj::Url::Context::HTTP_PROXY_REQUEST);
 
     auto client =
-        getHttpClient(context, headers, LimitEnforcer::KvOpType::PUT, urlStr, kj::mv(options));
+        getHttpClient(context, headers, LimitEnforcer::KvOpType::PUT, urlStr, traceContext);
 
     auto promise = context.waitForOutputLocks().then(
         [&context, client = kj::mv(client), urlStr = kj::mv(urlStr), headers = kj::mv(headers),

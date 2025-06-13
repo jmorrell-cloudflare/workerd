@@ -7,10 +7,10 @@ export default {
     const { USERS_NOTIFICATION_CONFIG } = env;
 
     console.log(USERS_NOTIFICATION_CONFIG);
-    await USERS_NOTIFICATION_CONFIG.put("test1", "1");
-    await USERS_NOTIFICATION_CONFIG.put("test2", "2");
-    await USERS_NOTIFICATION_CONFIG.put("test3", "3");
-    await USERS_NOTIFICATION_CONFIG.put("test4", "4");
+    await USERS_NOTIFICATION_CONFIG.put("test1", "11111");
+    await USERS_NOTIFICATION_CONFIG.put("test2", "22222");
+    await USERS_NOTIFICATION_CONFIG.put("test3", "33333");
+    await USERS_NOTIFICATION_CONFIG.put("test4", "44444");
 
     let res = await USERS_NOTIFICATION_CONFIG.list();
     let keys = res.keys.map(key => key.name);
