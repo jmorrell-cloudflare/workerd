@@ -605,6 +605,7 @@ jsg::Promise<void> KvNamespace::put(jsg::Lock& js,
         supportedBody = kj::mv(text);
       }
       KJ_CASE_ONEOF(object, jsg::JsObject) {
+        // TODO: Capture this error
         supportedBody = JSG_REQUIRE_NONNULL(putTypeHandler.tryUnwrap(js, object), TypeError,
             "KV put() accepts only strings, ArrayBuffers, ArrayBufferViews, and "
             "ReadableStreams as values.");
@@ -621,12 +622,17 @@ jsg::Promise<void> KvNamespace::put(jsg::Lock& js,
       KJ_CASE_ONEOF(text, kj::String) {
         headers.set(kj::HttpHeaderId::CONTENT_TYPE, MimeType::PLAINTEXT_STRING);
         expectedBodySize = uint64_t(text.size());
+        traceContext.userSpan.setTag("cloudflare.kv.query.value_type"_kjc, kj::str("text"_kjc));
       }
       KJ_CASE_ONEOF(data, kj::Array<byte>) {
         expectedBodySize = uint64_t(data.size());
+        traceContext.userSpan.setTag(
+            "cloudflare.kv.query.value_type"_kjc, kj::str("ArrayBuffer"_kjc));
       }
       KJ_CASE_ONEOF(stream, jsg::Ref<ReadableStream>) {
         expectedBodySize = stream->tryGetLength(StreamEncoding::IDENTITY);
+        traceContext.userSpan.setTag(
+            "cloudflare.kv.query.value_type"_kjc, kj::str("ReadableStream"_kjc));
       }
     }
 
