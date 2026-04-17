@@ -184,7 +184,19 @@ class Serializer final: v8::ValueSerializer::Delegate {
   // similar to ThrowDataCloneError() except that it formats the error message itself, and it
   // is expected to be called from KJ-ish code so it throws JsExceptionThrown rather than
   // returning.)
+  //
+  // If possible, the error message will include the dot/bracket path to `obj` within the
+  // root value(s) passed to `write()`. This adds no cost on the happy path; we only walk the
+  // tree looking for the offending object when we're already about to throw.
   [[noreturn]] void throwDataCloneErrorForObject(jsg::Lock& js, v8::Local<v8::Object> obj);
+
+  // Searches the roots captured in `writtenRoots` for `target` (matched by v8 object identity).
+  // Returns a path like `Array[0].foo.bar` (root's constructor name followed by the DFS-built
+  // traversal steps), or `kj::none` if `target` cannot be located or is the root itself
+  // (which would render as just the constructor name, redundant with the type already named
+  // in the error message). Only invoked on the error path; the walker is best-effort and
+  // deliberately avoids running user-defined getters/Proxy traps.
+  kj::Maybe<kj::String> findObjectPath(jsg::Lock& js, v8::Local<v8::Object> target);
 
   // v8::ValueSerializer::Delegate implementation
   void ThrowDataCloneError(v8::Local<v8::String> message) override;
@@ -201,6 +213,19 @@ class Serializer final: v8::ValueSerializer::Delegate {
   kj::Vector<jsg::JsRef<JsValue>> arrayBuffers;
   kj::Vector<std::shared_ptr<v8::BackingStore>> sharedBackingStores;
   kj::Vector<std::shared_ptr<v8::BackingStore>> backingStores;
+
+  // The values passed to the public `write()` at the outermost call depth, retained so we can
+  // DFS them to build a field path if serialization later fails. Only outermost writes are
+  // recorded — recursive calls from `WriteHostObject` (e.g. native-error property serialization,
+  // JSG `serialize()` implementations that write nested values) are tracked via `writeDepth`
+  // and do not append here. Zero additional cost on the happy path beyond one `JsRef`
+  // construction per public `write()` call; only walked on the error path.
+  kj::Vector<jsg::JsRef<JsValue>> writtenRoots;
+
+  // Depth counter for `write()`. Public callers see depth 0 on entry; recursive writes from
+  // within `WriteHostObject` bump this above zero so they don't pollute `writtenRoots`.
+  uint writeDepth = 0;
+
   bool released = false;
   bool treatClassInstancesAsPlainObjects;
   bool treatErrorsAsHostObjects = false;

@@ -90,6 +90,8 @@ export let basics = {
     // Let's quickly verify that if we use ctx.exports.GreeterLoopback *without* invoking it, then
     // we get an error that it isn't serializable. (This isn't really testing worker-loader, it's
     // more testing LoopbackServiceStub and that serializability is not inherited.)
+    // Frankenvalue::fromJs serializes the props object (a plain Object), so the path prefix
+    // is "Object" and the offending greeter lives at `.greeter`.
     assert.rejects(
       () =>
         worker.getEntrypoint('FancyPropsEntrypoint', {
@@ -101,8 +103,8 @@ export let basics = {
       {
         name: 'DataCloneError',
         message:
-          'Could not serialize object of type "LoopbackServiceStub". This type does not support ' +
-          'serialization.',
+          'Could not serialize object of type "LoopbackServiceStub" at "Object.greeter". ' +
+          'This type does not support serialization.',
       }
     );
   },

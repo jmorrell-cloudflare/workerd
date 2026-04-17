@@ -172,13 +172,312 @@ v8::Maybe<uint32_t> Serializer::GetSharedArrayBufferId(
   return v8::Just(n);
 }
 
+namespace {
+
+// True if `name` is a syntactically valid JavaScript identifier, suitable for use after a dot
+// in a path string (e.g. `foo.bar`). Non-identifier property names are emitted using the
+// quoted-bracket form (e.g. `foo['weird name']`) so the output is always unambiguous.
+//
+// JavaScript reserved words (like `class` or `new`) ARE syntactically valid in member-access
+// position and are rendered here with dot notation — `.class` / `.new` — which is technically
+// legal JS and avoids the extra bracket-form overhead for a category most readers will still
+// intuit as "a key named `class`".
+//
+// This is intentionally conservative about the character set: accepts only ASCII identifiers
+// plus `$` and `_`, even though JavaScript also permits a broader set of Unicode characters.
+// Accepting only ASCII is sufficient for our error-message use case and avoids pulling in
+// Unicode tables.
+bool isSimpleIdentifier(kj::StringPtr name) {
+  if (name.size() == 0) return false;
+  auto isStart = [](char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$';
+  };
+  auto isCont = [&](char c) { return isStart(c) || (c >= '0' && c <= '9'); };
+  if (!isStart(name[0])) return false;
+  for (size_t i = 1; i < name.size(); i++) {
+    if (!isCont(name[i])) return false;
+  }
+  return true;
+}
+
+// Appends a single-quoted representation of `text` to `out`, escaping characters that would
+// otherwise be ambiguous in an error message. Used for property names that aren't simple
+// identifiers (e.g. contain spaces, dots, or other non-identifier characters).
+//
+// We use single quotes (not double quotes) because the full error message wraps the path
+// itself in double quotes, like `... at "<path>". ...`. Using single quotes inside the path
+// keeps the message unambiguous without needing to escape embedded quotes.
+void appendQuoted(kj::Vector<char>& out, kj::StringPtr text) {
+  out.add('\'');
+  for (char c: text) {
+    switch (c) {
+      case '\'':
+        out.add('\\');
+        out.add('\'');
+        break;
+      case '\\':
+        out.add('\\');
+        out.add('\\');
+        break;
+      case '\n':
+        out.add('\\');
+        out.add('n');
+        break;
+      case '\r':
+        out.add('\\');
+        out.add('r');
+        break;
+      case '\t':
+        out.add('\\');
+        out.add('t');
+        break;
+      default:
+        out.add(c);
+        break;
+    }
+  }
+  out.add('\'');
+}
+
+// Appends a single step (property name or index) to `path`. `isArrayIndex` chooses between
+// `[N]` (numeric array index), `.foo` (simple identifier — including JS reserved words like
+// `class` or `new`), and `['weird name']` (anything else — spaces, non-identifier characters).
+void appendPathStep(kj::Vector<char>& path, kj::StringPtr name, bool isArrayIndex) {
+  if (isArrayIndex) {
+    path.add('[');
+    for (char c: name) path.add(c);
+    path.add(']');
+  } else if (isSimpleIdentifier(name)) {
+    path.add('.');
+    for (char c: name) path.add(c);
+  } else {
+    path.add('[');
+    appendQuoted(path, name);
+    path.add(']');
+  }
+}
+
+// Maximum recursion depth when searching for the offending object. Bounds worst-case stack
+// use for pathological inputs (e.g. very deeply nested JSON). The path reported will simply
+// stop at this depth; the fallback "no path" message is used if we can't locate `target`.
+constexpr size_t MAX_PATH_SEARCH_DEPTH = 1000;
+
+// Reads a data-property value from `obj` at `key` into `out`, returning true on success.
+// This deliberately skips accessor properties (getters/setters) so the walker never invokes
+// user-defined JS code on the error path. Proxy traps are also bypassed: if `obj` is a Proxy,
+// `GetOwnPropertyDescriptor` consults the Proxy's descriptor trap, but we further require
+// that the returned descriptor be a data descriptor (has `value`, not `get`/`set`).
+//
+// Any failure (property missing, descriptor-trap throw, accessor descriptor) returns false
+// without touching `*out`. Exceptions thrown by the trap are caught via the caller's
+// enclosing `v8::TryCatch` and must be reset by the caller before the next V8 call.
+bool readDataPropertyValue(
+    jsg::Lock& js, v8::Local<v8::Object> obj, v8::Local<v8::Name> key, v8::Local<v8::Value>& out) {
+  v8::Local<v8::Value> descriptorVal;
+  if (!obj->GetOwnPropertyDescriptor(js.v8Context(), key).ToLocal(&descriptorVal)) {
+    return false;
+  }
+  if (!descriptorVal->IsObject()) return false;  // undefined → no such property
+  auto descriptor = descriptorVal.As<v8::Object>();
+
+  // Data descriptors expose `value`; accessor descriptors expose `get` / `set`. We only walk
+  // data properties.
+  auto getStr = v8::String::NewFromUtf8Literal(js.v8Isolate, "get");
+  v8::Local<v8::Value> getVal;
+  if (descriptor->Get(js.v8Context(), getStr).ToLocal(&getVal) && !getVal->IsUndefined()) {
+    return false;  // accessor descriptor — skip
+  }
+  auto valueStr = v8::String::NewFromUtf8Literal(js.v8Isolate, "value");
+  v8::Local<v8::Value> value;
+  if (!descriptor->Get(js.v8Context(), valueStr).ToLocal(&value)) return false;
+  out = value;
+  return true;
+}
+
+// Recursive DFS that walks `current`, looking for `target` by v8 object identity. On hit,
+// `path` accumulates the step taken to reach the target (appended onto whatever prefix it
+// contains on entry). `seen` is a short ordered stack of objects already on the recursion
+// path; used for cycle detection with a linear scan since the depth is bounded.
+//
+// The caller is responsible for providing an enclosing `v8::TryCatch` — any exceptions
+// thrown by V8 or user Proxy traps are reset inside this function so the walk remains
+// best-effort. We deliberately avoid invoking user-defined accessors (see
+// `readDataPropertyValue`) so this walk has no observable side effects on user JS.
+bool findPathRecursive(jsg::Lock& js,
+    v8::TryCatch& tryCatch,
+    v8::Local<v8::Value> current,
+    v8::Local<v8::Object> target,
+    kj::Vector<char>& path,
+    kj::Vector<v8::Local<v8::Object>>& seen,
+    size_t depth) {
+  // Primitives cannot match (target is always an object) and have no children to recurse into.
+  if (!current->IsObject()) return false;
+
+  auto currentObj = current.As<v8::Object>();
+
+  // Identity match: v8::Local<T>::operator== compares the underlying JS identity.
+  if (currentObj == target) return true;
+
+  if (depth >= MAX_PATH_SEARCH_DEPTH) return false;
+
+  // Cycle detection: don't recurse into an object we're already inside.
+  for (auto& prev: seen) {
+    if (prev == currentObj) return false;
+  }
+  seen.add(currentObj);
+  KJ_DEFER(seen.removeLast());
+
+  // Arrays: walk indexed entries in order. Array elements are typically data properties,
+  // so we use the fast `Get(index)` path — if a user defined an indexed accessor, we
+  // might still fire it, but that's an extremely rare case and we reset any resulting
+  // exception below.
+  if (currentObj->IsArray()) {
+    auto arr = currentObj.As<v8::Array>();
+    uint32_t len = arr->Length();
+    for (uint32_t i = 0; i < len; i++) {
+      v8::Local<v8::Value> elem;
+      if (!arr->Get(js.v8Context(), i).ToLocal(&elem)) {
+        tryCatch.Reset();
+        continue;
+      }
+      auto savedSize = path.size();
+      auto idxStr = kj::str(i);
+      appendPathStep(path, idxStr, /* isArrayIndex = */ true);
+      if (findPathRecursive(js, tryCatch, elem, target, path, seen, depth + 1)) return true;
+      path.resize(savedSize);
+    }
+  }
+
+  // Walk own enumerable string-keyed properties. This approximates V8's ValueSerializer,
+  // which serializes plain objects' own enumerable named keys (no symbols) in insertion
+  // order. We use `GetOwnPropertyDescriptor` in `readDataPropertyValue` so accessor
+  // properties are silently skipped — V8's serializer would invoke them, but doing so on
+  // our diagnostic walk could cause observable side effects or further failures.
+  v8::Local<v8::Array> names;
+  if (!currentObj
+           ->GetOwnPropertyNames(js.v8Context(),
+               static_cast<v8::PropertyFilter>(
+                   v8::PropertyFilter::ONLY_ENUMERABLE | v8::PropertyFilter::SKIP_SYMBOLS),
+               v8::KeyConversionMode::kConvertToString)
+           .ToLocal(&names)) {
+    tryCatch.Reset();
+    return false;
+  }
+
+  uint32_t nameCount = names->Length();
+  for (uint32_t i = 0; i < nameCount; i++) {
+    v8::Local<v8::Value> nameVal;
+    if (!names->Get(js.v8Context(), i).ToLocal(&nameVal)) {
+      tryCatch.Reset();
+      continue;
+    }
+
+    // Is this an integer-indexed key? If so, render it with bracket form. For arrays we
+    // already walked indexed properties above, so skip to avoid double-walking.
+    bool isNumericKey = false;
+    {
+      v8::Local<v8::Uint32> asUint;
+      if (nameVal->ToArrayIndex(js.v8Context()).ToLocal(&asUint)) {
+        if (currentObj->IsArray()) continue;  // already walked via arr->Get(i)
+        isNumericKey = true;
+      } else {
+        tryCatch.Reset();
+      }
+    }
+
+    if (!nameVal->IsName()) continue;  // defensive; SKIP_SYMBOLS ensures strings
+    auto nameKey = nameVal.As<v8::Name>();
+
+    v8::Local<v8::Value> child;
+    if (!readDataPropertyValue(js, currentObj, nameKey, child)) {
+      tryCatch.Reset();
+      continue;
+    }
+
+    v8::Local<v8::String> nameStr;
+    if (!nameVal->ToString(js.v8Context()).ToLocal(&nameStr)) {
+      tryCatch.Reset();
+      continue;
+    }
+    auto nameKj = JsValue(nameStr).toString(js);
+
+    auto savedSize = path.size();
+    appendPathStep(path, nameKj, /* isArrayIndex = */ isNumericKey);
+    if (findPathRecursive(js, tryCatch, child, target, path, seen, depth + 1)) return true;
+    path.resize(savedSize);
+  }
+
+  return false;
+}
+
+}  // namespace
+
+kj::Maybe<kj::String> Serializer::findObjectPath(jsg::Lock& js, v8::Local<v8::Object> target) {
+  // Guard the whole walk in a TryCatch so that any V8 exceptions thrown during property
+  // enumeration (e.g. from a Proxy's ownKeys trap, or a Proxy's getOwnPropertyDescriptor
+  // trap) don't leak out as pending exceptions on the isolate — which would taint the
+  // subsequent `js.domException(...)` / `js.throwException(...)` that this function's
+  // caller is about to perform.
+  v8::TryCatch tryCatch(js.v8Isolate);
+  tryCatch.SetVerbose(false);
+
+  // Search each recorded root in order. Thanks to the `writeDepth` guard in `write()`,
+  // `writtenRoots` contains only values passed to the outermost public `write()` call(s),
+  // not sub-values written recursively from `WriteHostObject` — so paths are always
+  // anchored at a meaningful root.
+  for (auto& root: writtenRoots) {
+    kj::Vector<char> path;
+    kj::Vector<v8::Local<v8::Object>> seen;
+    v8::Local<v8::Value> rootHandle = root.getHandle(js);
+
+    if (findPathRecursive(js, tryCatch, rootHandle, target, path, seen, 0)) {
+      if (path.size() == 0) {
+        // Target IS the root. The constructor name of the root would just repeat the type
+        // already named in the error message ("of type X at X"), so we suppress the "at"
+        // clause entirely. This matches the legacy no-path message shape.
+        tryCatch.Reset();
+        return kj::none;
+      }
+
+      // Use the root value's constructor name as the path prefix so the output reads like
+      // an expression you might type: `Array[0].foo`, `Object.nested.bad`, etc. For plain
+      // object literals this is "Object"; for the JSRPC args array it's "Array"; for a
+      // class instance it's the class name.
+      KJ_ASSERT(rootHandle->IsObject(),
+          "walker only matched into a non-object root, which shouldn't be possible");
+      auto rootName = kj::str(rootHandle.As<v8::Object>()->GetConstructorName());
+
+      kj::Vector<char> out(rootName.size() + path.size());
+      for (char c: rootName) out.add(c);
+      for (char c: path) out.add(c);
+      return kj::heapString(out.asPtr());
+    }
+  }
+
+  // Reset any residual exception from the walk so the caller's throw is clean.
+  tryCatch.Reset();
+  return kj::none;
+}
+
 void Serializer::throwDataCloneErrorForObject(jsg::Lock& js, v8::Local<v8::Object> obj) {
   // The default error that V8 would generate is "#<TypeName> could not be cloned." -- for some
   // reason, it surrounds the type name in "#<>", which seems bizarre? Let's generate a better
   // error.
-  auto message = kj::str("Could not serialize object of type \"", obj->GetConstructorName(),
-      "\". This type does "
-      "not support serialization.");
+  //
+  // When possible, we also include the field path where the offending object was encountered
+  // within the value(s) passed to `write()`. This walk only runs on the error path, so it has
+  // no cost on successful serializations.
+  kj::String message;
+  KJ_IF_SOME(path, findObjectPath(js, obj)) {
+    message = kj::str("Could not serialize object of type \"", obj->GetConstructorName(),
+        "\" at \"", path,
+        "\". This type does "
+        "not support serialization.");
+  } else {
+    message = kj::str("Could not serialize object of type \"", obj->GetConstructorName(),
+        "\". This type does "
+        "not support serialization.");
+  }
   auto exception = js.domException(kj::str("DataCloneError"), kj::mv(message));
   js.throwException(jsg::JsValue(KJ_ASSERT_NONNULL(exception.tryGetHandle(js))));
 }
@@ -386,6 +685,17 @@ void Serializer::transfer(Lock& js, const JsValue& value) {
 
 void Serializer::write(Lock& js, const JsValue& value) {
   KJ_ASSERT(!released, "The data has already been released.");
+
+  // Only record the outermost call as a root for field-path discovery. Recursive calls from
+  // within `WriteHostObject` (native-error serialization, JSG `serialize()` implementations
+  // writing nested fields, external handlers writing nested stream/RPC data) would otherwise
+  // pollute `writtenRoots` with sub-objects and cause misleading paths to be reported.
+  if (writeDepth == 0) {
+    writtenRoots.add(jsg::JsRef<JsValue>(js, value));
+  }
+  ++writeDepth;
+  KJ_DEFER(--writeDepth);
+
   KJ_ASSERT(check(ser.WriteValue(js.v8Context(), value)));
 }
 

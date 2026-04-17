@@ -69,6 +69,9 @@ export let structuredCloneNotBroken = {
     strictEqual(cloned.get('foo'), '123');
     strictEqual(cloned.get('bar'), 'abc');
 
+    // The TextEncoder IS the value being cloned. `structuredClone` uses the default
+    // Serializer options with no root label, so when the offending value is the root itself
+    // we don't emit an "at ..." clause — the message is unchanged from pre-field-path days.
     throws(() => structuredClone(new TextEncoder()), {
       name: 'DataCloneError',
       code: DOMException.DATA_CLONE_ERR,

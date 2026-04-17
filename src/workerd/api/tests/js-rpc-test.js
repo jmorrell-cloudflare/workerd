@@ -850,12 +850,18 @@ export let namedServiceBinding = {
     });
 
     // Can't serialize instances of classes that aren't derived from RpcTarget.
+    // getNonRpcClass() returns `{ obj: new NonRpcClass() }`, so the bad value sits at .obj
+    // of the returned plain object. The path prefix is "Object" (constructor name of the
+    // root value being serialized).
     await assert.rejects(() => env.MyService.getNonRpcClass(), {
       name: 'DataCloneError',
       message:
-        'Could not serialize object of type "NonRpcClass". This type does not support ' +
-        'serialization.',
+        'Could not serialize object of type "NonRpcClass" at "Object.obj". This type does ' +
+        'not support serialization.',
     });
+    // getNullPrototypeObject() returns the null-proto object itself, so the bad value IS the
+    // serialized root. No "at" clause is emitted — the constructor name would just repeat
+    // the type already named in the message.
     await assert.rejects(() => env.MyService.getNullPrototypeObject(), {
       name: 'DataCloneError',
       message:
@@ -1317,25 +1323,27 @@ export let serializeRpcPromiseOrProprety = {
 
     // If a JsRpcPromise appears somewhere in the serialization tree, it'll just fail serialization.
     // NOTE: We could choose to make this work later.
+    // getNestedRpcPromise returns `{ value: callback() }`, so the RpcPromise lives at
+    // `.value` of the returned plain Object — reported as `Object.value`.
     await assert.rejects(() => env.MyService.getNestedRpcPromise(func), {
       name: 'DataCloneError',
       message:
-        'Could not serialize object of type "RpcPromise". This type does not support ' +
-        'serialization.',
+        'Could not serialize object of type "RpcPromise" at "Object.value". This type does ' +
+        'not support serialization.',
     });
     await assert.rejects(() => env.MyService.getNestedRpcPromise(func).value, {
       name: 'DataCloneError',
       message:
-        'Could not serialize object of type "RpcPromise". This type does not support ' +
-        'serialization.',
+        'Could not serialize object of type "RpcPromise" at "Object.value". This type does ' +
+        'not support serialization.',
     });
     await assert.rejects(
       () => env.MyService.getNestedRpcPromise(func).value.x,
       {
         name: 'DataCloneError',
         message:
-          'Could not serialize object of type "RpcPromise". This type does not support ' +
-          'serialization.',
+          'Could not serialize object of type "RpcPromise" at "Object.value". This type does ' +
+          'not support serialization.',
       }
     );
 
@@ -1360,25 +1368,27 @@ export let serializeRpcPromiseOrProprety = {
       x: 456,
     });
     assert.strictEqual(await env.MyService.getRpcProperty(func).x, 456);
+    // getNestedRpcProperty returns `{ value: callback.foo }`, so the RpcProperty lives at
+    // `.value` of the returned plain Object.
     await assert.rejects(() => env.MyService.getNestedRpcProperty(func), {
       name: 'DataCloneError',
       message:
-        'Could not serialize object of type "RpcProperty". This type does not support ' +
-        'serialization.',
+        'Could not serialize object of type "RpcProperty" at "Object.value". This type does ' +
+        'not support serialization.',
     });
     await assert.rejects(() => env.MyService.getNestedRpcProperty(func).value, {
       name: 'DataCloneError',
       message:
-        'Could not serialize object of type "RpcProperty". This type does not support ' +
-        'serialization.',
+        'Could not serialize object of type "RpcProperty" at "Object.value". This type does ' +
+        'not support serialization.',
     });
     await assert.rejects(
       () => env.MyService.getNestedRpcProperty(func).value.x,
       {
         name: 'DataCloneError',
         message:
-          'Could not serialize object of type "RpcProperty". This type does not support ' +
-          'serialization.',
+          'Could not serialize object of type "RpcProperty" at "Object.value". This type does ' +
+          'not support serialization.',
       }
     );
 
@@ -1400,6 +1410,165 @@ export let serializeRpcPromiseOrProprety = {
         message: '"foo" is not a function.',
       }
     );
+  },
+};
+
+// Verifies that DataCloneError messages from the JSRPC serializer include the field path
+// where the offending value lives — huge win when debugging large nested payloads. The path
+// prefix is the constructor name of the serialization root (the args array for JSRPC calls,
+// the returned value for method results), so you get paths like `Array[0].payload.event` for
+// call arguments or `Object.value` for return values.
+export let dataCloneErrorIncludesFieldPath = {
+  async test(controller, env, ctx) {
+    // ── Argument serialization: single-arg call ─────────────────────────
+    // identity(x) fails to serialize `x` because it has a null prototype. The call args
+    // array wraps it as [x], so the bad value is at `Array[0]`.
+    {
+      const bad = Object.create(null);
+      bad.foo = 123;
+      await assert.rejects(() => env.MyService.identity(bad), {
+        name: 'DataCloneError',
+        message:
+          'Could not serialize object of type "Object" at "Array[0]". This type does not ' +
+          'support serialization.',
+      });
+    }
+
+    // ── Argument serialization: nested bad value in first arg ───────────
+    {
+      const inner = Object.create(null);
+      inner.x = 1;
+      const payload = { outer: { middle: { leaf: inner } } };
+      await assert.rejects(() => env.MyService.identity(payload), {
+        name: 'DataCloneError',
+        message:
+          'Could not serialize object of type "Object" at "Array[0].outer.middle.leaf". ' +
+          'This type does not support serialization.',
+      });
+    }
+
+    // ── Argument serialization: bad value is in the second arg ──────────
+    // twoArgsMethod(i, j) takes two positional args; when only `j` is bad, the path should
+    // reflect `Array[1]`, not `Array[0]`.
+    {
+      class BadClass {
+        constructor() {
+          this.x = 1;
+        }
+      }
+      await assert.rejects(
+        () => env.MyService.twoArgsMethod(5, new BadClass()),
+        {
+          name: 'DataCloneError',
+          message:
+            'Could not serialize object of type "BadClass" at "Array[1]". This type does ' +
+            'not support serialization.',
+        }
+      );
+    }
+
+    // ── Argument serialization: bad value inside an array ───────────────
+    {
+      const bad = Object.create(null);
+      const payload = { items: ['ok', 'also ok', { nested: bad }] };
+      await assert.rejects(() => env.MyService.identity(payload), {
+        name: 'DataCloneError',
+        message:
+          'Could not serialize object of type "Object" at "Array[0].items[2].nested". ' +
+          'This type does not support serialization.',
+      });
+    }
+
+    // ── Non-identifier property names are quoted with brackets ──────────
+    // Keys containing dots, spaces, or starting with digits use the `['...']` form so the
+    // path is unambiguous. Single quotes are used inside because the outer error message
+    // wraps the path in double quotes.
+    {
+      const bad = Object.create(null);
+      const payload = {
+        'has spaces': {
+          'has.dots': {
+            '123startsWithDigit': bad,
+          },
+        },
+      };
+      await assert.rejects(() => env.MyService.identity(payload), {
+        name: 'DataCloneError',
+        message:
+          'Could not serialize object of type "Object" at ' +
+          "\"Array[0]['has spaces']['has.dots']['123startsWithDigit']\". " +
+          'This type does not support serialization.',
+      });
+    }
+
+    // ── Reserved words use plain dot notation ───────────────────────────
+    // `obj.class` is technically legal JS in member-access position, so we render it as
+    // `.class` rather than adding bracket-form noise. The path reads cleanly enough.
+    {
+      const bad = Object.create(null);
+      const payload = { class: bad };
+      await assert.rejects(() => env.MyService.identity(payload), {
+        name: 'DataCloneError',
+        message:
+          'Could not serialize object of type "Object" at "Array[0].class". ' +
+          'This type does not support serialization.',
+      });
+    }
+
+    // ── Numeric keys on plain (non-array) objects use bracket form ──────
+    // `{ '0': bad }` must render as `[0]`, not `.0`, since `foo.0` isn't valid JS.
+    {
+      const bad = Object.create(null);
+      const payload = { '0': bad };
+      await assert.rejects(() => env.MyService.identity(payload), {
+        name: 'DataCloneError',
+        message:
+          'Could not serialize object of type "Object" at "Array[0][0]". ' +
+          'This type does not support serialization.',
+      });
+    }
+
+    // ── Accessor-backed properties are NOT walked twice (no extra side effects) ──
+    // V8's ValueSerializer invokes accessor getters once during serialization itself
+    // (that's how it reads the value it needs to serialize). Our path walker must NOT
+    // then invoke the same getter a second time while building the error message —
+    // otherwise a getter with side effects is observed twice by user code. We verify
+    // this by using a call counter and asserting exactly 1 invocation (V8's) after
+    // the failed RPC call.
+    //
+    // As a side effect: since our walker skips accessor descriptors entirely, it also
+    // can't locate the offender through that property and falls back to the no-path
+    // message. That's acceptable — the tradeoff is a cleaner error path.
+    {
+      let callCount = 0;
+      const bad = Object.create(null);
+      const payload = {};
+      Object.defineProperty(payload, 'behindGetter', {
+        enumerable: true,
+        get() {
+          callCount++;
+          return bad;
+        },
+      });
+      await assert.rejects(() => env.MyService.identity(payload), {
+        name: 'DataCloneError',
+        // No "at ..." clause — walker couldn't locate `bad` through the accessor.
+        message:
+          'Could not serialize object of type "Object". This type does not support ' +
+          'serialization.',
+      });
+      assert.strictEqual(
+        callCount,
+        1,
+        'Walker must not invoke user-defined getters on the error path (V8 fires once, ' +
+          'walker must not fire again)'
+      );
+    }
+
+    // ── Return-value serialization ──────────────────────────────────────
+    // Return-value failures go through the same serializer and produce paths prefixed by
+    // the return value's constructor name (e.g. `Object.value`). Those paths are covered
+    // extensively by the serializeRpcPromiseOrProprety and nonClass tests above.
   },
 };
 

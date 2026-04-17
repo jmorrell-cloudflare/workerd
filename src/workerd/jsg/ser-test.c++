@@ -283,5 +283,202 @@ KJ_TEST("serialization") {
                 "roundTrip(obj).bar.val.bar.val.bar.val.i",
       "number", "321");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────
+// Tests for the field-path annotation in DataCloneError messages.
+//
+// These exercise the lazy-walk-on-error machinery in `Serializer` that locates the
+// offending object within the root value and reports a JS-like path in the error
+// message (e.g. `at "Object.foo.bar"` or `at "Array[0].nested"`). The path prefix is
+// the constructor name of the serialization root; the walker-built suffix describes
+// how to reach the offender from that root.
+//
+// We set `treatClassInstancesAsPlainObjects = false` so that class instances and
+// null-prototype objects trigger the error path — with the default true, V8 serializes
+// them as plain objects and no error occurs.
+// ─────────────────────────────────────────────────────────────────────────────────────
+
+struct SerPathTestContext: public ContextGlobalObject {
+  // Serialization tags for the types below. Follows the same enum-at-context-level
+  // pattern used by SerTestContext so `JSG_SERIALIZABLE` can find the definition.
+  enum class SerializationTag { WRAPPER };
+
+  // Resource type whose `serialize()` calls `serializer.write()` on a wrapped value —
+  // i.e. performs a recursive write from within `WriteHostObject`. Used to regression-
+  // test that recursive writes don't pollute `writtenRoots` (B-1 in the review).
+  struct Wrapper: public jsg::Object {
+    JsRef<JsValue> inner;
+    Wrapper(JsRef<JsValue> inner): inner(kj::mv(inner)) {}
+
+    static jsg::Ref<Wrapper> constructor(jsg::Lock& js, JsRef<JsValue> inner) {
+      return js.alloc<Wrapper>(kj::mv(inner));
+    }
+
+    JsRef<JsValue> getInner(Lock& js) {
+      return inner.addRef(js);
+    }
+
+    JSG_RESOURCE_TYPE(Wrapper) {
+      JSG_READONLY_PROTOTYPE_PROPERTY(inner, getInner);
+    }
+
+    void serialize(jsg::Lock& js, jsg::Serializer& serializer) {
+      // Recursively write the inner value through the public API. The `writeDepth`
+      // counter in `write()` must prevent this from adding to `writtenRoots`, otherwise
+      // the path reported for a failure inside `inner` would be anchored at `inner`
+      // instead of at the outer caller's root.
+      serializer.write(js, JsValue(inner.getHandle(js)));
+    }
+    static jsg::Ref<Wrapper> deserialize(
+        Lock& js, SerializationTag tag, Deserializer& deserializer) {
+      return js.alloc<Wrapper>(JsRef<JsValue>(js, deserializer.readValue(js)));
+    }
+    JSG_SERIALIZABLE(SerializationTag::WRAPPER);
+  };
+
+  // Attempts to serialize `value` with `treatClassInstancesAsPlainObjects = false`. On
+  // success returns undefined; on failure the DataCloneError propagates to the caller
+  // (which then inspects `err.message` in JS).
+  void strictSerialize(Lock& js, JsValue value) {
+    Serializer ser(js,
+        Serializer::Options{
+          .treatClassInstancesAsPlainObjects = false,
+        });
+    ser.write(js, value);
+    (void)ser.release();
+  }
+
+  JSG_RESOURCE_TYPE(SerPathTestContext) {
+    JSG_NESTED_TYPE(Wrapper);
+    JSG_METHOD(strictSerialize);
+  }
+};
+JSG_DECLARE_ISOLATE_TYPE(SerPathTestIsolate, SerPathTestContext, SerPathTestContext::Wrapper);
+
+KJ_TEST("DataCloneError messages include field paths for serialization failures") {
+  Evaluator<SerPathTestContext, SerPathTestIsolate> e(v8System);
+
+  // Helper template — invokes strictSerialize in a try/catch and returns the error message
+  // or 'ok'. Used by every assertion below.
+  constexpr kj::StringPtr HARNESS = R"(
+    function tryClone(v) {
+      try {
+        strictSerialize(v);
+        return 'ok';
+      } catch (e) {
+        return e.message;
+      }
+    }
+  )"_kj;
+
+  auto run = [&](kj::StringPtr setup, kj::StringPtr expected) {
+    e.expectEval(kj::str(HARNESS, setup), "string", expected);
+  };
+
+  // ── Case 1: Bad value at a deep path; root is a plain Object ────────────
+  // Walker finds the null-proto object at `.foo.bar.baz`; the path prefix is the root's
+  // constructor name, "Object".
+  run("const bad = Object.create(null);\n"
+      "tryClone({foo: {bar: {baz: bad}}})",
+      "Could not serialize object of type \"Object\" at \"Object.foo.bar.baz\". "
+      "This type does not support serialization.");
+
+  // ── Case 2: Target is the root itself → no "at" clause ──────────────────
+  // If we reported a path here it would be just the constructor name, which already
+  // appears in the "of type" portion of the message. Suppress the clause entirely —
+  // matches the pre-feature message shape for root-level failures.
+  run("tryClone(Object.create(null))",
+      "Could not serialize object of type \"Object\". "
+      "This type does not support serialization.");
+
+  // ── Case 3: Array indices on an array root ──────────────────────────────
+  // The root is a v8::Array, so the prefix reads "Array".
+  run("const bad = Object.create(null);\n"
+      "tryClone([1, 2, bad])",
+      "Could not serialize object of type \"Object\" at \"Array[2]\". "
+      "This type does not support serialization.");
+
+  // ── Case 4: Mixed array + named access ──────────────────────────────────
+  run("const bad = Object.create(null);\n"
+      "tryClone({items: ['ok', {nested: bad}]})",
+      "Could not serialize object of type \"Object\" at \"Object.items[1].nested\". "
+      "This type does not support serialization.");
+
+  // ── Case 5: Cycle — walker must terminate and still find the offender ──
+  // Construct a cycle (a↔b) and place the bad value at `a.bad`. The walker needs to
+  // handle revisits without looping while still locating the bad value via its
+  // direct-property path.
+  run("const bad = Object.create(null);\n"
+      "const a = {};\n"
+      "const b = {};\n"
+      "a.b = b; b.a = a; a.bad = bad;\n"
+      "tryClone(a)",
+      "Could not serialize object of type \"Object\" at \"Object.bad\". "
+      "This type does not support serialization.");
+
+  // ── Case 6: Reserved words use plain dot notation ───────────────────────
+  // `obj.class` is legal member access in JS, so we render it without bracket-form
+  // noise. `.new`, `.return`, etc. similarly render plainly.
+  run("const bad = Object.create(null);\n"
+      "tryClone({class: bad})",
+      "Could not serialize object of type \"Object\" at \"Object.class\". "
+      "This type does not support serialization.");
+
+  // ── Case 7: Numeric key on a plain (non-array) object → bracket form ────
+  // `{ '0': bad }` must render as `[0]`, not `.0` (which wouldn't parse as JS).
+  run("const bad = Object.create(null);\n"
+      "tryClone({'0': bad})",
+      "Could not serialize object of type \"Object\" at \"Object[0]\". "
+      "This type does not support serialization.");
+
+  // ── Case 8: Non-identifier key with apostrophe → escaped ────────────────
+  // `appendQuoted` wraps the name in single quotes and backslash-escapes embedded
+  // apostrophes, so the key `it's` becomes the path component `'it\'s'`.
+  run("const bad = Object.create(null);\n"
+      "const payload = {}; payload[\"it's\"] = bad;\n"
+      "tryClone(payload)",
+      "Could not serialize object of type \"Object\" at \"Object['it\\'s']\". "
+      "This type does not support serialization.");
+
+  // ── Case 9: Accessor-backed property — walker skips it (B-2 fix) ────────
+  // V8's own ValueSerializer invokes accessor getters when serializing a plain object,
+  // so the getter fires once during serialization (the offender is then located for us
+  // by V8 itself). The walker, however, must NOT fire the getter a second time when
+  // searching for the path — otherwise a getter with side effects would be observed
+  // twice by user code. Since our walker skips accessor descriptors entirely, it also
+  // cannot locate the offender through that property and falls back to the no-path
+  // message. We assert `callCount === 1` (V8's single invocation) rather than 2.
+  run("let callCount = 0;\n"
+      "const bad = Object.create(null);\n"
+      "const payload = {};\n"
+      "Object.defineProperty(payload, 'behind', {\n"
+      "  enumerable: true,\n"
+      "  get() { callCount++; return bad; }\n"
+      "});\n"
+      "const msg = tryClone(payload);\n"
+      "msg + '|callCount=' + callCount",
+      "Could not serialize object of type \"Object\". "
+      "This type does not support serialization.|callCount=1");
+
+  // ── Case 10: Regression guard for B-1 (recursive-write pollution) ───────
+  // Wrapper.serialize() recursively calls serializer.write() on its `inner` value.
+  // If the depth guard in write() weren't in place, that recursive call would push
+  // `bad` onto `writtenRoots`, and when serialization fails, findObjectPath would
+  // match the second entry by identity and report a misleading path pointing at the
+  // wrapper's payload directly.
+  //
+  // The walker cannot descend into JSG resource types (their own-enumerable string
+  // properties are empty), so legitimately locating the offender is impossible here.
+  // The post-fix expected behavior is the no-path fallback message.
+  //
+  // If this test starts failing with any `at "..."` clause, it means the depth guard
+  // was broken and recursive writes are again polluting `writtenRoots`.
+  run("const bad = Object.create(null);\n"
+      "const w = new Wrapper(bad);\n"
+      "tryClone({wrapped: w})",
+      "Could not serialize object of type \"Object\". "
+      "This type does not support serialization.");
+}
+
 }  // namespace
 }  // namespace workerd::jsg::test

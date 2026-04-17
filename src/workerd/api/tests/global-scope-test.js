@@ -307,7 +307,9 @@ export const structuredClone = {
       strictEqual(cloned.get('bar'), 'abc');
     }
 
-    // Verify that trying to serialize a non-serializable API type throws.
+    // Verify that trying to serialize a non-serializable API type throws. When the offending
+    // value is the root itself and the Serializer has no root label (the default for
+    // `structuredClone`), the message doesn't include an "at ..." clause.
     throws(() => globalThis.structuredClone(new TextEncoder()), {
       name: 'DataCloneError',
       code: DOMException.DATA_CLONE_ERR,
