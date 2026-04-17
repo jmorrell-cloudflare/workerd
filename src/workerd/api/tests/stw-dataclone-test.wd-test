@@ -1,0 +1,83 @@
+using Workerd = import "/workerd/workerd.capnp";
+
+# Reproduction test for DataCloneError when a Streaming Tail Worker (STW) forwards
+# tail event data to another worker via JSRPC (service binding).
+#
+# Background:
+#   In production (Vega's cloudflare-streaming-tail-receptor), the STW receives
+#   TailStream events and forwards them to a "processor" worker via a service
+#   binding (JSRPC). Under certain conditions, the JSRPC serializer rejects some
+#   objects with:
+#     DataCloneError: Could not serialize object of type "Object".
+#       This type does not support serialization.
+#
+# The JSRPC serializer (jsg::Serializer with treatClassInstancesAsPlainObjects=false)
+# is stricter than standard V8 structured clone: it rejects any object whose prototype
+# is NOT Object.prototype (including null-prototype objects and class instances).
+#
+# This test exercises every code path where non-serializable objects might appear in
+# the STW → JSRPC pipeline:
+#
+#   Scenario 1: Forward raw TailStream event objects (onset, log, outcome, etc.)
+#   Scenario 2: Forward objects with null prototypes (Object.create(null))
+#   Scenario 3: Forward class instances
+#   Scenario 4: Forward diagnostic channel messages
+#   Scenario 5: Forward objects containing nested non-serializable values
+
+const unitTests :Workerd.Config = (
+  services = [
+    # The traced worker — produces various types of tail events.
+    # Its test() export runs first, generating events for the STW.
+    (name = "traced", worker = .tracedWorker),
+
+    # The JSRPC receiver — a WorkerEntrypoint that accepts forwarded data.
+    # Its test() export runs second to verify received events.
+    (name = "receiver", worker = .receiverWorker),
+
+    # The STW — receives tail events and forwards them to the receiver via JSRPC.
+    # Its test() export runs LAST (after all tail events are delivered), to
+    # verify which forwarding attempts succeeded vs failed.
+    (name = "tail", worker = .tailWorker),
+  ],
+);
+
+# ── Traced worker ──────────────────────────────────────────────────────────────
+# A simple worker whose invocations are tailed. It produces console.log output,
+# diagnostic channel messages, and exceptions to generate different event types.
+# Note: compatibilityDate is intentionally omitted so it's supplied by the
+# `wd_test` bazel macro, which runs tests against multiple variants (baseline,
+# all-compat-flags, all-autogates).
+const tracedWorker :Workerd.Worker = (
+  modules = [
+    (name = "worker", esModule = embed "stw-dataclone-traced.js"),
+  ],
+  compatibilityFlags = ["nodejs_compat", "experimental"],
+  bindings = [
+    # Self-binding so the test() export can call its own fetch() handler.
+    (name = "SERVICE", service = "traced"),
+  ],
+  streamingTails = ["tail"],
+);
+
+# ── Streaming Tail Worker ──────────────────────────────────────────────────────
+# Receives tail events and attempts to forward them via JSRPC to the receiver.
+# This is the worker where DataCloneError would occur.
+const tailWorker :Workerd.Worker = (
+  modules = [
+    (name = "worker", esModule = embed "stw-dataclone-tail.js"),
+  ],
+  compatibilityFlags = ["nodejs_compat", "experimental"],
+  bindings = [
+    (name = "RECEIVER", service = (name = "receiver", entrypoint = "Receiver")),
+  ],
+);
+
+# ── JSRPC Receiver ─────────────────────────────────────────────────────────────
+# A WorkerEntrypoint that accepts data from the tail worker. This is analogous
+# to the "processor" service binding in the Vega production setup.
+const receiverWorker :Workerd.Worker = (
+  modules = [
+    (name = "worker", esModule = embed "stw-dataclone-receiver.js"),
+  ],
+  compatibilityFlags = ["nodejs_compat", "experimental"],
+);

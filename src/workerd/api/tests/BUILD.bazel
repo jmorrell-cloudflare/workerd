@@ -86,6 +86,19 @@ wd_test(
     tags = ["no-coverage"],
 )
 
+# Reproduction test for DataCloneError when a STW forwards tail events via JSRPC.
+# Exercises the JSRPC serialization boundary with null-prototype objects,
+# class instances, and other non-plain-object types.
+wd_test(
+    src = "stw-dataclone-test.wd-test",
+    args = ["--experimental"],
+    data = [
+        "stw-dataclone-traced.js",
+        "stw-dataclone-tail.js",
+        "stw-dataclone-receiver.js",
+    ],
+)
+
 # Test for a worker that can log to itself using the isTracer parameter
 wd_test(
     src = "self-logger-test.wd-test",
